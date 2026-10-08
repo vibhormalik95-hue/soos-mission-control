@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: soos-mission-control
+    runtime: node
+    plan: free
+    buildCommand: pnpm install && pnpm build
+    startCommand: pnpm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: API_KEY
+        sync: false
+      # MISSION_CONTROL_DATA_DIR defaults to ./.data (ephemeral on free tier —
+      # the board resets on restart; durable history lives in the VM's
+      # worker-activity.jsonl / slice-history.jsonl).
+      # AUTH_PASS intentionally unset: the admin account is created via /setup
+      # in the browser on first visit.
