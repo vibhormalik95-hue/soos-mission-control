@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { randomBytes } from 'crypto';
 import { dirname } from 'path';
 import { config, ensureDirExists } from './config';
 import { runMigrations } from './migrations';
@@ -142,6 +143,27 @@ function seedAdminUserFromEnv(dbConn: Database.Database): void {
 
   const count = (dbConn.prepare('SELECT COUNT(*) as count FROM users').get() as CountRow).count
   if (count > 0) return
+
+  // Google-admin bootstrap (our deployment): if MC_BOOTSTRAP_GOOGLE_EMAIL is set,
+  // seed an approved Google-provider admin so Google Sign-In works on a fresh
+  // database with no local-password ceremony. The password hash is random and
+  // unusable — Google is the only login path.
+  const bootstrapEmail = (process.env.MC_BOOTSTRAP_GOOGLE_EMAIL || '').trim().toLowerCase()
+  if (bootstrapEmail && bootstrapEmail.includes('@')) {
+    const username = bootstrapEmail
+      .split('@')[0]
+      .toLowerCase()
+      .replace(/[^a-z0-9_.-]/g, '')
+      .slice(0, 64) || 'admin'
+    const displayName = username.charAt(0).toUpperCase() + username.slice(1)
+    const unusableHash = hashPassword(randomBytes(32).toString('hex'))
+    dbConn.prepare(`
+      INSERT OR IGNORE INTO users (username, display_name, password_hash, role, provider, email, is_approved, workspace_id)
+      VALUES (?, ?, ?, 'admin', 'google', ?, 1, 1)
+    `).run(username, displayName, unusableHash, bootstrapEmail)
+    logger.info(`Seeded Google admin user from MC_BOOTSTRAP_GOOGLE_EMAIL: ${username}`)
+    return
+  }
 
   const username = process.env.AUTH_USER || 'admin'
   const password = resolveSeedAuthPassword()
