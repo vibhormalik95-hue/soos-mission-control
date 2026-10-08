@@ -1,266 +1,273 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { apiFetch } from '@/lib/api-client'
-import { useMissionControl } from '@/store'
-import { useNavigateToPanel } from '@/lib/navigation'
-import { useSmartPoll } from '@/lib/use-smart-poll'
-import { SignalPill, getLocalOsStatus, getProviderHealth, getMcHealth } from './widget-primitives'
-import { OnboardingChecklistWidget } from './widgets/onboarding-checklist-widget'
-import { EmptyStateLaunchpad } from './empty-state-launchpad'
-import { WidgetGrid } from './widget-grid'
-import type { DbStats, ClaudeStats, LogLike, DashboardData } from './widget-primitives'
+
+/**
+ * Command view — the operator's single screen.
+ *
+ * Vision: one page, no scrolling through sections, every pixel earning its
+ * place. One glance shows all live work; the operator steers from the same
+ * page. Live tasks are the hero (not empty fleet cards); the activity stream
+ * and the steer bar complete the loop.
+ */
+
+interface LiveTask {
+  id: number
+  title: string
+  status: string
+  assigned_to?: string
+  created_at: number
+  updated_at: number
+  step: string
+  stepAt: number
+}
+
+interface FeedItem {
+  id: string
+  taskTitle: string
+  author: string
+  content: string
+  at: number
+}
+
+const LIVE_STATUSES = new Set(['in_progress', 'review', 'quality_review'])
+
+function ago(ts: number): string {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  return `${Math.floor(h / 24)}d`
+}
+
+function statusColor(status: string): string {
+  switch (status) {
+    case 'in_progress':
+      return 'bg-amber-400'
+    case 'review':
+    case 'quality_review':
+      return 'bg-sky-400'
+    case 'done':
+      return 'bg-emerald-400'
+    case 'failed':
+      return 'bg-red-400'
+    default:
+      return 'bg-zinc-500'
+  }
+}
 
 export function Dashboard() {
-  const {
-    sessions,
-    setSessions,
-    connection,
-    dashboardMode,
-    subscription,
-    logs,
-    agents,
-    tasks,
-    setActiveConversation,
-  } = useMissionControl()
+  const [tasks, setTasks] = useState<LiveTask[]>([])
+  const [feed, setFeed] = useState<FeedItem[]>([])
+  const [agents, setAgents] = useState(0)
+  const [clock, setClock] = useState('')
+  const [steerTask, setSteerTask] = useState<string>('')
+  const [steerMsg, setSteerMsg] = useState('')
+  const [sending, setSending] = useState(false)
 
-  const navigateToPanel = useNavigateToPanel()
-  const isLocal = dashboardMode === 'local'
+  const load = useCallback(async () => {
+    try {
+      const [taskData, agentData] = await Promise.all([
+        apiFetch<{ tasks?: any[] }>('/api/tasks?limit=100'),
+        apiFetch<{ agents?: any[] }>('/api/agents').catch(() => ({ agents: [] as any[] })),
+      ])
+      const live = (taskData.tasks || []).filter((t) => LIVE_STATUSES.has(t.status))
+      setAgents((agentData.agents || []).length)
 
-  const subscriptionLabel = subscription?.type
-    ? subscription.type.charAt(0).toUpperCase() + subscription.type.slice(1)
-    : null
-
-  const SUBSCRIPTION_PRICES: Record<string, Record<string, number>> = {
-    anthropic: { pro: 20, max: 100, max_5x: 200, team: 30, enterprise: 30 },
-    openai: { plus: 20, chatgpt: 20, pro: 200, team: 30, enterprise: 0 },
-  }
-
-  const subscriptionPrice = subscription?.provider && subscription?.type
-    ? SUBSCRIPTION_PRICES[subscription.provider]?.[subscription.type] ?? null
-    : null
-
-  const [systemStats, setSystemStats] = useState<any>(null)
-  const [dbStats, setDbStats] = useState<DbStats | null>(null)
-  const [claudeStats, setClaudeStats] = useState<ClaudeStats | null>(null)
-  const [githubStats, setGithubStats] = useState<any>(null)
-  const [hermesCronJobCount, setHermesCronJobCount] = useState(0)
-  const [loading, setLoading] = useState({
-    system: true,
-    sessions: true,
-    claude: true,
-    github: true,
-  })
-
-  const loadDashboard = useCallback(async () => {
-    const requests: Promise<void>[] = []
-
-    requests.push(
-      apiFetch<any>('/api/status?action=dashboard')
-        .then((data) => {
-          if (data && !data.error) {
-            setSystemStats(data)
-            if (data.db) setDbStats(data.db)
+      const enriched = await Promise.all(
+        live.map(async (t) => {
+          let step = 'working…'
+          let stepAt = t.updated_at || t.created_at || 0
+          let comments: any[] = []
+          try {
+            const c = await apiFetch<{ comments?: any[] }>(`/api/tasks/${t.id}/comments`)
+            comments = c.comments || []
+            const last = comments[comments.length - 1]
+            if (last) {
+              step = String(last.content || 'working…').slice(0, 160)
+              stepAt = last.created_at || stepAt
+            }
+          } catch {
+            /* comments are best-effort */
           }
-        })
-        .catch(() => {})
-        .finally(() => setLoading(prev => ({ ...prev, system: false })))
-    )
-
-    requests.push(
-      apiFetch<any>('/api/sessions')
-        .then((data) => {
-          if (data && !data.error) setSessions(data.sessions || data)
-        })
-        .catch(() => {})
-        .finally(() => setLoading(prev => ({ ...prev, sessions: false })))
-    )
-
-    if (isLocal) {
-      requests.push(
-        apiFetch<any>('/api/claude/sessions')
-          .then((data) => {
-            if (data?.stats) setClaudeStats(data.stats)
-          })
-          .catch(() => {})
-          .finally(() => setLoading(prev => ({ ...prev, claude: false })))
+          return {
+            task: {
+              id: t.id,
+              title: String(t.title || 'Untitled'),
+              status: t.status,
+              assigned_to: t.assigned_to,
+              created_at: t.created_at || 0,
+              updated_at: t.updated_at || 0,
+              step,
+              stepAt,
+            } as LiveTask,
+            comments,
+          }
+        }),
       )
+      const sorted = enriched.map((e) => e.task).sort((a, b) => b.stepAt - a.stepAt)
+      setTasks(sorted)
 
-      requests.push(
-        apiFetch<any>('/api/github?action=stats')
-          .then((data) => {
-            if (data && !data.error) setGithubStats(data)
+      const items: FeedItem[] = []
+      for (const { task, comments } of enriched) {
+        for (const c of comments.slice(-6)) {
+          items.push({
+            id: `${task.id}-${c.id ?? c.created_at}`,
+            taskTitle: task.title,
+            author: String(c.author || ''),
+            content: String(c.content || '').slice(0, 220),
+            at: c.created_at || 0,
           })
-          .catch(() => {})
-          .finally(() => setLoading(prev => ({ ...prev, github: false })))
-      )
-
-      requests.push(
-        apiFetch<any>('/api/hermes')
-          .then((data) => {
-            if (data?.cronJobCount != null) setHermesCronJobCount(data.cronJobCount)
-          })
-          .catch(() => {})
-      )
-    } else {
-      setLoading(prev => ({ ...prev, claude: false, github: false }))
+        }
+      }
+      items.sort((a, b) => b.at - a.at)
+      setFeed(items.slice(0, 40))
+    } catch {
+      /* keep last good state on poll failure */
     }
+  }, [])
 
-    await Promise.allSettled(requests)
-  }, [isLocal, setSessions])
+  useEffect(() => {
+    load()
+    const i = setInterval(load, 10000)
+    return () => clearInterval(i)
+  }, [load])
 
-  useSmartPoll(loadDashboard, isLocal ? 15000 : 60000, { pauseWhenConnected: true })
+  useEffect(() => {
+    const tick = () =>
+      setClock(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
+    tick()
+    const i = setInterval(tick, 15000)
+    return () => clearInterval(i)
+  }, [])
 
-  // Computed values
-  const isSystemLoading = loading.system && !systemStats
-  const isSessionsLoading = loading.sessions && sessions.length === 0
-  const isClaudeLoading = isLocal && loading.claude && !claudeStats
-  const isGithubLoading = isLocal && loading.github && !githubStats
-
-  const memPct = systemStats?.memory?.total
-    ? Math.round((systemStats.memory.used / systemStats.memory.total) * 100)
-    : null
-
-  const diskPct = parseInt(systemStats?.disk?.usage || '', 10)
-  const systemLoad = Math.max(memPct ?? 0, Number.isFinite(diskPct) ? diskPct : 0)
-
-  const activeSessions = sessions.filter((s) => s.active).length
-  const errorCount = logs.filter((l) => l.level === 'error').length
-  const onlineAgents = dbStats
-    ? dbStats.agents.total - (dbStats.agents.byStatus?.offline ?? 0)
-    : agents.filter((a) => a.status !== 'offline').length
-
-  const claudeLocalSessions = sessions.filter((s) => s.kind === 'claude-code')
-  const codexLocalSessions = sessions.filter((s) => s.kind === 'codex-cli')
-  const hermesLocalSessions = sessions.filter((s) => s.kind === 'hermes')
-  const claudeActive = claudeLocalSessions.filter((s) => s.active).length
-  const codexActive = codexLocalSessions.filter((s) => s.active).length
-  const hermesActive = hermesLocalSessions.filter((s) => s.active).length
-
-  const runningTasks = dbStats?.tasks.byStatus?.in_progress ?? tasks.filter((t) => t.status === 'in_progress').length
-  const inboxCount = dbStats?.tasks.byStatus?.inbox ?? 0
-  const assignedCount = dbStats?.tasks.byStatus?.assigned ?? 0
-  const reviewCount = (dbStats?.tasks.byStatus?.review ?? 0) + (dbStats?.tasks.byStatus?.quality_review ?? 0)
-  const doneCount = dbStats?.tasks.byStatus?.done ?? 0
-  const backlogCount = inboxCount + assignedCount + reviewCount
-
-  const localOsStatus = isSystemLoading
-    ? { value: 'Loading...', status: 'warn' as const }
-    : getLocalOsStatus(memPct, Number.isFinite(diskPct) ? diskPct : null)
-
-  const claudeHealth = isClaudeLoading
-    ? { value: 'Loading...', status: 'warn' as const }
-    : getProviderHealth(claudeStats?.active_sessions ?? claudeActive, claudeStats?.total_sessions ?? claudeLocalSessions.length)
-
-  const codexHealth = isSessionsLoading
-    ? { value: 'Loading...', status: 'warn' as const }
-    : getProviderHealth(codexActive, codexLocalSessions.length)
-
-  const hermesHealth = isSessionsLoading
-    ? { value: 'Loading...', status: 'warn' as const }
-    : getProviderHealth(hermesActive, hermesLocalSessions.length)
-
-  const mcHealth = isSystemLoading
-    ? { value: 'Loading...', status: 'warn' as const }
-    : getMcHealth(systemStats, dbStats, errorCount)
-
-  const localSessionLogs: LogLike[] = isLocal
-    ? sessions.reduce<LogLike[]>((acc, session) => {
-        const ts = session.lastActivity || session.startTime || 0
-        if (!ts) return acc
-
-        const lastPrompt = typeof (session as any).lastUserPrompt === 'string'
-          ? (session as any).lastUserPrompt.trim()
-          : ''
-
-        acc.push({
-          id: `local-session-${session.id}-${ts}`,
-          timestamp: ts,
-          level: 'info',
-          source: session.kind === 'codex-cli' ? 'codex-local' : session.kind === 'hermes' ? 'hermes-local' : 'claude-local',
-          message: lastPrompt
-            ? `Prompt: ${lastPrompt}`
-            : `${session.active ? 'Active' : 'Idle'} session: ${session.key || session.id}`,
-        })
-        return acc
-      }, [])
-    : []
-
-  const mergedRecentLogs: LogLike[] = (isLocal ? [...logs, ...localSessionLogs] : logs)
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .filter((entry, index, arr) => arr.findIndex((x) => x.id === entry.id) === index)
-    .slice(0, 10)
-
-  const recentErrorLogs = mergedRecentLogs.filter((log) => log.level === 'error').length
-  const gatewayHealthStatus = connection.isConnected ? 'good' as const : 'bad' as const
-
-  const openSession = useCallback((session: any) => {
-    const kind = String(session?.kind || '')
-    const sid = String(session?.id || '')
-    if (!sid) return
-    setActiveConversation(`session:${kind}:${sid}`)
-    navigateToPanel('chat')
-  }, [setActiveConversation, navigateToPanel])
-
-  const dashboardData: DashboardData = {
-    isLocal,
-    systemStats,
-    dbStats,
-    claudeStats,
-    githubStats,
-    loading,
-    sessions,
-    logs,
-    agents,
-    tasks,
-    connection,
-    subscription,
-    navigateToPanel,
-    openSession,
-    memPct,
-    diskPct,
-    systemLoad,
-    activeSessions,
-    errorCount,
-    onlineAgents,
-    claudeActive,
-    codexActive,
-    hermesActive,
-    claudeLocalSessions,
-    codexLocalSessions,
-    hermesLocalSessions,
-    runningTasks,
-    inboxCount,
-    assignedCount,
-    reviewCount,
-    doneCount,
-    backlogCount,
-    mergedRecentLogs,
-    recentErrorLogs,
-    localOsStatus,
-    claudeHealth,
-    codexHealth,
-    hermesHealth,
-    mcHealth,
-    gatewayHealthStatus,
-    isSystemLoading,
-    isSessionsLoading,
-    isClaudeLoading,
-    isGithubLoading,
-    hermesCronJobCount,
-    subscriptionLabel,
-    subscriptionPrice,
-  }
+  const send = useCallback(async () => {
+    if (!steerTask || !steerMsg.trim() || sending) return
+    setSending(true)
+    try {
+      await apiFetch(`/api/tasks/${steerTask}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: steerMsg.trim() }),
+      })
+      setSteerMsg('')
+      load()
+    } catch {
+      /* surface nothing — the next poll recovers */
+    } finally {
+      setSending(false)
+    }
+  }, [steerTask, steerMsg, sending, load])
 
   return (
-    <div className="p-5 space-y-4">
-      <OnboardingChecklistWidget />
-      <EmptyStateLaunchpad
-        agentCount={dbStats?.agents.total ?? agents.length}
-        taskCount={dbStats?.tasks.total ?? tasks.length}
-        onNavigate={navigateToPanel}
-      />
-      <WidgetGrid data={dashboardData} />
+    <div className="flex flex-col gap-3 h-[calc(100dvh-190px)] min-h-[520px] overflow-hidden">
+      {/* status strip */}
+      <div className="flex items-center gap-4 px-4 h-10 shrink-0 rounded-lg border border-border bg-card text-sm">
+        <span className="flex items-center gap-2 font-medium">
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          LIVE
+        </span>
+        <span className="font-mono tabular-nums">
+          {tasks.length} running
+        </span>
+        <span className="font-mono tabular-nums text-muted-foreground">
+          {agents} agents
+        </span>
+        <span className="ml-auto font-mono tabular-nums text-muted-foreground">{clock}</span>
+      </div>
+
+      {/* main grid */}
+      <div className="flex flex-col md:flex-row gap-3 flex-1 min-h-0">
+        {/* live tasks — the hero */}
+        <section className="flex-1 min-w-0 flex flex-col rounded-lg border border-border bg-card overflow-hidden min-h-0">
+          <header className="px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-muted-foreground border-b border-border shrink-0">
+            Live tasks
+          </header>
+          <div className="flex-1 overflow-y-auto divide-y divide-border">
+            {tasks.map((t) => (
+              <div key={t.id} className="px-4 py-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <span className={`w-2 h-2 rounded-full shrink-0 ${statusColor(t.status)} animate-pulse`} />
+                  <span className="font-medium truncate">{t.title}</span>
+                  <span className="ml-auto pl-3 text-xs font-mono tabular-nums text-muted-foreground shrink-0">
+                    {t.assigned_to || 'unassigned'} · {t.created_at ? ago(t.created_at) : '—'}
+                  </span>
+                </div>
+                <p className="mt-1 pl-[18px] text-sm text-muted-foreground truncate">{t.step}</p>
+              </div>
+            ))}
+            {tasks.length === 0 && (
+              <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+                All quiet — no agents running.
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* activity stream */}
+        <section className="w-full md:w-[340px] shrink-0 flex flex-col rounded-lg border border-border bg-card overflow-hidden min-h-0 max-h-[38dvh] md:max-h-none">
+          <header className="px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-muted-foreground border-b border-border shrink-0">
+            Activity
+          </header>
+          <div className="flex-1 overflow-y-auto divide-y divide-border">
+            {feed.map((f) => (
+              <div key={f.id} className="px-4 py-2.5">
+                <div className="flex items-baseline gap-2 min-w-0">
+                  <span className="text-[11px] font-mono tabular-nums text-muted-foreground shrink-0">
+                    {f.at ? ago(f.at) : '—'}
+                  </span>
+                  <span className="text-xs font-medium truncate">{f.taskTitle}</span>
+                </div>
+                <p className="mt-0.5 text-[13px] leading-snug text-muted-foreground line-clamp-2">
+                  {f.content}
+                </p>
+              </div>
+            ))}
+            {feed.length === 0 && (
+              <div className="p-6 text-center text-sm text-muted-foreground">
+                No activity yet.
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+
+      {/* steer bar */}
+      <div className="flex gap-2 shrink-0">
+        <select
+          value={steerTask}
+          onChange={(e) => setSteerTask(e.target.value)}
+          className="h-10 max-w-[180px] rounded-lg border border-border bg-card px-2 text-sm text-foreground"
+          aria-label="Task to steer"
+        >
+          <option value="">Steer…</option>
+          {tasks.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.title.slice(0, 42)}
+            </option>
+          ))}
+        </select>
+        <input
+          value={steerMsg}
+          onChange={(e) => setSteerMsg(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') send()
+          }}
+          placeholder={steerTask ? 'Message the worker…' : 'Pick a task to steer it'}
+          disabled={!steerTask}
+          className="flex-1 h-10 rounded-lg border border-border bg-card px-3 text-sm text-foreground placeholder:text-muted-foreground disabled:opacity-50"
+        />
+        <button
+          onClick={send}
+          disabled={sending || !steerTask || !steerMsg.trim()}
+          className="h-10 px-4 rounded-lg bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {sending ? '…' : 'Send'}
+        </button>
+      </div>
     </div>
   )
 }
