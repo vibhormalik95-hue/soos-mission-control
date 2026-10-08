@@ -6,6 +6,7 @@ import { NavRail } from '@/components/layout/nav-rail'
 import { HeaderBar } from '@/components/layout/header-bar'
 import { LiveFeed } from '@/components/layout/live-feed'
 import { Dashboard } from '@/components/dashboard/dashboard'
+import { CommandView } from '@/components/command/command-view'
 import { LogViewerPanel } from '@/components/panels/log-viewer-panel'
 import { CronManagementPanel } from '@/components/panels/cron-management-panel'
 import { MemoryBrowserPanel } from '@/components/panels/memory-browser-panel'
@@ -440,6 +441,42 @@ export default function Home() {
 
   if (!isClient || !bootComplete) {
     return <Loader variant="page" steps={isClient ? initSteps : undefined} />
+  }
+
+  // Command mode: the overview route IS the operator's single screen.
+  // No nav rail, no header bar, no live-feed sidebar, no banners — the
+  // command view owns the whole viewport (100dvh, no body scroll).
+  // Everything else stays one tap away via the view's "more" menu.
+  // Auth/onboarding/boot logic above is untouched.
+  if (activeTab === 'overview') {
+    return (
+      <div className="h-[100dvh] overflow-hidden bg-background text-foreground flex flex-col">
+        <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-2 focus:left-2 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-md focus:text-sm focus:font-medium">
+          {tc('skipToMainContent')}
+        </a>
+        <main id="main-content" className="flex-1 min-h-0 flex flex-col" role="main">
+          <ErrorBoundary key={activeTab}>
+            <CommandView />
+          </ErrorBoundary>
+        </main>
+
+        {/* Chat panel overlay */}
+        <ChatPanel />
+
+        {/* Global exec approval overlay (shown regardless of active panel) */}
+        <ExecApprovalOverlay />
+
+        {/* Global Project Manager Modal */}
+        {showProjectManagerModal && (
+          <ProjectManagerModal
+            onClose={() => setShowProjectManagerModal(false)}
+            onChanged={async () => { await fetchProjects() }}
+          />
+        )}
+
+        <OnboardingWizard />
+      </div>
+    )
   }
 
   return (
