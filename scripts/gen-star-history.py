@@ -41,10 +41,9 @@ def fetch_star_dates(repo: str) -> list[datetime]:
          "-q", ".[].starred_at"],
         capture_output=True, text=True, check=True,
     ).stdout.split()
-    dates = sorted(datetime.fromisoformat(d.replace("Z", "+00:00")) for d in out)
-    if not dates:
-        raise SystemExit(f"no stargazer data returned for {repo}")
-    return dates
+    # Zero stars is a valid state (new repos) — return empty and let the
+    # caller render an empty chart instead of failing the workflow.
+    return sorted(datetime.fromisoformat(d.replace("Z", "+00:00")) for d in out)
 
 
 def build_series(dates: list[datetime]) -> list[tuple[datetime, int]]:
@@ -143,12 +142,20 @@ def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit(__doc__)
     repo, prefix = sys.argv[1], sys.argv[2]
-    pts = build_series(fetch_star_dates(repo))
+    dates = fetch_star_dates(repo)
+    if dates:
+        pts = build_series(dates)
+        star_count = pts[-1][1]
+    else:
+        # No stargazers yet: synthesize a single zero point so the workflow
+        # still produces a valid (empty) chart and the commit step runs.
+        pts = [(datetime.now(timezone.utc), 0)]
+        star_count = 0
     for mode, theme in THEMES.items():
         path = f"{prefix}-{mode}.svg"
         with open(path, "w") as f:
             f.write(render(repo, pts, theme))
-        print(f"wrote {path} ({pts[-1][1]} stars, {len(pts)} points)")
+        print(f"wrote {path} ({star_count} stars, {len(pts)} points)")
 
 
 if __name__ == "__main__":
